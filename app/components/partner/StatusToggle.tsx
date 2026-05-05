@@ -105,14 +105,49 @@ export default function StatusToggle({ user, onUpdate }: StatusToggleProps) {
       const broadcasterAvatar = user?.avatar || '';
 
       const resp = await startSession(sessionId, broadcasterId, broadcasterName, broadcasterAvatar);
-      
+
       if (!resp.error) {
+        // Cache the broadcaster's LiveKit token + URL so the live-session page
+        // can connect as a publisher without round-tripping `fetchSessionToken`
+        // (which mints a *viewer* token). Without this, the broadcaster lands
+        // on the page as a viewer and cannot publish their video/audio.
+        try {
+          if (typeof window !== 'undefined' && resp.data) {
+            sessionStorage.setItem(
+              `liveBroadcaster:${sessionId}`,
+              JSON.stringify({
+                token: resp.data.token,
+                livekitSocketURL: resp.data.livekitSocketURL,
+                broadcasterId,
+                broadcasterName,
+                broadcasterProfilePicture: broadcasterAvatar,
+                startedAt: Date.now(),
+              })
+            );
+          }
+        } catch (storageErr) {
+          console.warn('[GoLive] Failed to cache broadcaster session:', storageErr);
+        }
+
         toast.success('Live Session Started!', { icon: '🎥' });
         onUpdate();
-        // 4. Redirect to Live Session Room
-        router.push(`/live-sessions/${sessionId}`);
+        // 4. Redirect to Live Session Room (broadcaster mode)
+        router.push(`/live-sessions/${sessionId}?role=broadcaster`);
       } else {
-        toast.error(resp.message || 'Failed to start live session');
+        // Roll back the online toggle if startSession failed (incl. the new
+        // 15 s timeout from useLiveSocket). Otherwise the partner stays marked
+        // online with no live session, which surfaces a confusing UI state.
+        if (resp?.message === 'START_SESSION_TIMEOUT') {
+          toast.error('Live server did not respond. Please try again.');
+        } else {
+          toast.error(resp.message || 'Failed to start live session');
+        }
+        try {
+          await performRequest('/api/user/change-status', { status: 'offline' });
+        } catch (rollbackErr) {
+          console.warn('[GoLive] Failed to roll back status:', rollbackErr);
+        }
+        onUpdate();
       }
     } catch (error: any) {
       toast.error(error.message || 'Failed to go live');

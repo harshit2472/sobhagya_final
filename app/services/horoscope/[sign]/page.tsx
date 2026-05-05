@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { ArrowLeft, Calendar, Star, Heart, TrendingUp } from 'lucide-react';
+import { Calendar, Star, Heart, TrendingUp } from 'lucide-react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import Head from 'next/head';
@@ -694,21 +694,6 @@ export default function ZodiacSignPage() {
         <link href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500;1,600;1,700&display=swap" rel="stylesheet" />
       </Head>
       <div className="min-h-screen bg-white">
-        {/* Header */}
-      <div className="bg-white shadow-sm border-b border-gray-200">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-16">
-            <Link 
-              href="/services/horoscope"
-              className="flex items-center gap-2 text-gray-600 hover:text-orange-600 transition-colors duration-200"
-            >
-              <ArrowLeft className="w-5 h-5" />
-              <span className="font-medium">Back to Horoscope</span>
-            </Link>
-          </div>
-        </div>
-      </div>
-
       {/* Sun Sign Banner */}
       <div className="bg-[#FCF4E9] text-[#745802] py-12">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">

@@ -1,7 +1,7 @@
 'use client';
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { useRouter, useParams } from 'next/navigation';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useRouter, useParams, useSearchParams } from 'next/navigation';
 import { useLiveSocket, ChatMessage, QueueItem } from '../../hooks/useLiveSocket';
 import { isAuthenticated, getUserDetails, getAuthToken } from '../../utils/auth-utils';
 import { fetchWalletBalance as simpleFetchWalletBalance } from '../../utils/production-api';
@@ -10,7 +10,7 @@ import DakshinaModal from '../../components/calling/ui/DakshinaModal';
 import {
   ArrowLeft, Heart, Lock, Globe, X, Send,
   Phone, Loader2, AlertCircle, Eye, Gift,
-  Wallet, Mic, MicOff, PhoneOff
+  Wallet, Mic, MicOff, PhoneOff, Users, UserPlus, StopCircle
 } from 'lucide-react';
 import Link from 'next/link';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -272,6 +272,158 @@ function CallRoomController({ isInCall, isMuted, onConnected }: { isInCall: bool
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/*  Broadcaster Publish Controller                                       */
+/*  Ensures the broadcaster's camera + microphone are published once     */
+/*  the LiveKit room is connected. Reacts to mute/unmute toggles and to  */
+/*  reconnect events (e.g. after a refresh).                             */
+/* ────────────────────────────────────────────────────────────────────── */
+function BroadcasterPublishController({
+  isMuted,
+  onConnected,
+  onRemoteParticipantConnected,
+  onRemoteParticipantDisconnected,
+}: {
+  isMuted: boolean;
+  onConnected?: () => void;
+  onRemoteParticipantConnected?: (identity: string) => void;
+  onRemoteParticipantDisconnected?: (identity: string) => void;
+}) {
+  const room = useRoomContext();
+  const { localParticipant } = useLocalParticipant();
+  const lastAppliedRef = useRef<{ muted: boolean } | null>(null);
+  const connectedFiredRef = useRef(false);
+
+  // Fallback signal for "user accepted my invite": LiveKit room sees the
+  // viewer connect even when the backend's `call_started` socket broadcast
+  // never fires (which happens when activeCall isn't persisted with a
+  // channelId). The broadcaster needs *some* trigger to flip into in-call UI.
+  useEffect(() => {
+    if (!room) return;
+    const handleConnected = (p: any) => {
+      const identity = p?.identity || '';
+      if (!identity) return;
+      console.log('[Broadcaster] LiveKit ParticipantConnected:', identity);
+      try { onRemoteParticipantConnected?.(identity); } catch (err) { console.warn('[Broadcaster] onRemoteParticipantConnected threw:', err); }
+    };
+    const handleDisconnected = (p: any) => {
+      const identity = p?.identity || '';
+      if (!identity) return;
+      console.log('[Broadcaster] LiveKit ParticipantDisconnected:', identity);
+      try { onRemoteParticipantDisconnected?.(identity); } catch (err) { console.warn('[Broadcaster] onRemoteParticipantDisconnected threw:', err); }
+    };
+    room.on('participantConnected' as any, handleConnected);
+    room.on('participantDisconnected' as any, handleDisconnected);
+    return () => {
+      room.off('participantConnected' as any, handleConnected);
+      room.off('participantDisconnected' as any, handleDisconnected);
+    };
+  }, [room, onRemoteParticipantConnected, onRemoteParticipantDisconnected]);
+
+  // Request and publish camera + mic once the room is connected.
+  useEffect(() => {
+    if (!room || !localParticipant) return;
+    if (room.state !== ConnectionState.Connected) return;
+
+    const last = lastAppliedRef.current;
+    if (last && last.muted === isMuted) return;
+
+    (async () => {
+      try {
+        await Promise.all([
+          localParticipant.setCameraEnabled(true),
+          localParticipant.setMicrophoneEnabled(!isMuted),
+        ]);
+        lastAppliedRef.current = { muted: isMuted };
+        console.log('[Broadcaster] Camera+mic published, mic muted =', isMuted);
+      } catch (err) {
+        console.warn('[Broadcaster] Failed to publish camera/mic:', err);
+      }
+    })();
+
+    if (!connectedFiredRef.current) {
+      connectedFiredRef.current = true;
+      try { onConnected?.(); } catch (err) { console.warn('[Broadcaster] onConnected handler threw:', err); }
+    }
+  }, [room, localParticipant, isMuted, room?.state, onConnected]);
+
+  // Re-publish on (re)connect events.
+  useEffect(() => {
+    if (!room) return;
+    const handleConnected = async () => {
+      try {
+        await Promise.all([
+          localParticipant?.setCameraEnabled(true),
+          localParticipant?.setMicrophoneEnabled(!isMuted),
+        ]);
+        lastAppliedRef.current = { muted: isMuted };
+        console.log('[Broadcaster] Re-published camera+mic after (re)connect.');
+        if (!connectedFiredRef.current) {
+          connectedFiredRef.current = true;
+          try { onConnected?.(); } catch (err) { console.warn('[Broadcaster] onConnected handler threw:', err); }
+        }
+      } catch (err) {
+        console.warn('[Broadcaster] (re)connect publish failed:', err);
+      }
+    };
+    room.on('connected' as any, handleConnected);
+    room.on('reconnected' as any, handleConnected);
+    return () => {
+      room.off('connected' as any, handleConnected);
+      room.off('reconnected' as any, handleConnected);
+    };
+  }, [room, localParticipant, isMuted, onConnected]);
+
+  return null;
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
+/*  Broadcaster Self-Preview                                             */
+/*  Used when the current user IS the broadcaster — shows the local      */
+/*  camera publication (mirrored, like a selfie cam).                    */
+/* ────────────────────────────────────────────────────────────────────── */
+function BroadcasterSelfPreview({ broadcasterName, broadcasterAvatar }: { broadcasterName: string; broadcasterAvatar: string }) {
+  // Don't pass `onlySubscribed: true` — we want local camera publications
+  // (which are not "subscribed" — they are published by us locally).
+  const tracks = useTracks([Track.Source.Camera]);
+  const localVideoTrack = tracks.find(t => t.publication?.kind === 'video' && t.participant?.isLocal);
+  const [imgError, setImgError] = useState(false);
+
+  if (!localVideoTrack) {
+    return (
+      <div className="absolute inset-0 flex flex-col items-center justify-center bg-gradient-to-b from-orange-50 via-white to-amber-50/40 stars-bg">
+        <div className="relative">
+          {!imgError && broadcasterAvatar ? (
+            <img
+              src={broadcasterAvatar}
+              alt={broadcasterName}
+              className="w-32 h-32 sm:w-40 sm:h-40 rounded-full object-cover border-4 border-orange-200/60 shadow-2xl animate-breathe"
+              onError={() => setImgError(true)}
+            />
+          ) : (
+            <div className="w-32 h-32 sm:w-40 sm:h-40 rounded-full bg-gradient-to-br from-orange-400 to-amber-500 flex items-center justify-center border-4 border-white shadow-2xl animate-breathe">
+              <span className="text-5xl sm:text-6xl font-bold text-white uppercase">{broadcasterName?.charAt(0)}</span>
+              <div className="absolute inset-0 rounded-full border-2 border-orange-300/40 animate-sacred-glow" />
+            </div>
+          )}
+          <div className="absolute inset-x-[-10px] inset-y-[-10px] rounded-full border-2 border-orange-300/20 animate-ping" style={{ animationDuration: '3s' }} />
+        </div>
+        <div className="mt-8 text-center px-6">
+          <p className="text-orange-600 text-base font-bold tracking-wider animate-pulse uppercase">Starting your live stream...</p>
+          <p className="text-gray-400 text-xs mt-2 font-medium italic">Camera is warming up. Make sure permissions are granted.</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="absolute inset-0 bg-black">
+      {/* Mirror the broadcaster's preview so it feels like a selfie cam. */}
+      <VideoTrack trackRef={localVideoTrack} className="w-full h-full object-cover scale-x-[-1]" />
+    </div>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /*  Broadcaster Video                                                    */
 /* ────────────────────────────────────────────────────────────────────── */
 function BroadcasterVideo({ broadcasterName, broadcasterAvatar }: { broadcasterName: string; broadcasterAvatar: string }) {
@@ -351,22 +503,70 @@ function sameId(a: any, b: string): boolean {
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
+/*  Broadcaster cache                                                   */
+/*  StatusToggle stores the publisher token + URL in sessionStorage     */
+/*  before redirecting here with `?role=broadcaster`. Reading it lets   */
+/*  the broadcaster connect to LiveKit as a *publisher* without ever    */
+/*  hitting `fetchSessionToken` (which mints viewer tokens).            */
+/* ────────────────────────────────────────────────────────────────────── */
+interface BroadcasterCache {
+  token: string;
+  livekitSocketURL: string;
+  broadcasterId: string;
+  broadcasterName: string;
+  broadcasterProfilePicture: string;
+  startedAt: number;
+}
+
+function readBroadcasterCache(sessionId: string): BroadcasterCache | null {
+  if (typeof window === 'undefined' || !sessionId) return null;
+  try {
+    const raw = sessionStorage.getItem(`liveBroadcaster:${sessionId}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as BroadcasterCache;
+    // Stale guard: a 6-hour-old cache means the page was reopened long after
+    // the session ended. Better to fall back to viewer mode than connect with
+    // a likely-expired token.
+    if (Date.now() - (parsed.startedAt || 0) > 6 * 3600 * 1000) {
+      sessionStorage.removeItem(`liveBroadcaster:${sessionId}`);
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────────── */
 /*  Main Page                                                            */
 /* ────────────────────────────────────────────────────────────────────── */
 export default function LiveSessionViewPage() {
   const router = useRouter();
   const params = useParams();
+  const searchParams = useSearchParams();
   const sessionId = params?.sessionId as string;
+
+  /* ── broadcaster detection (URL ?role + sessionStorage cache) ── */
+  const isBroadcasterRole = searchParams?.get('role') === 'broadcaster';
+  // Memoize the cache read so we don't re-parse JSON on every render. We
+  // intentionally key on sessionId only — the cache itself doesn't change
+  // mid-session; if it's gone we fall back to viewer mode.
+  const broadcasterCache = useMemo(
+    () => (isBroadcasterRole ? readBroadcasterCache(sessionId) : null),
+    [isBroadcasterRole, sessionId]
+  );
+  const isBroadcaster = !!broadcasterCache;
 
   const {
     isConnected, joinSession, leaveSession, fetchSessionToken,
     getChats, sendChat, joinQueue, leaveQueue, getQueue,
     getActiveCall, addLike, getLikes, joinRoomParticipant, acceptInvite, endCall,
+    endSessionBroadcaster, emitSendInvite,
     emitConnectedWithLivekit,
-    onChatUpdate, onViewerUpdate, onViewerLeft, onSessionEnded,
-    onCallStarted, onInviteReceived, onCallEnd, onQueueJoined, onLikeUpdate, onGiftReceived, onGiftRequest, emitSendGift,
+    onChatUpdate, onViewerUpdate, onViewerLeft, onSessionEnded, onSessionStarted,
+    onCallStarted, onCallEnd, onQueueJoined, onLikeUpdate, onGiftReceived, onGiftRequest, onSendInvite, emitSendGift,
     fetchGifts: fetchGiftsSocket,
-  } = useLiveSocket();
+  } = useLiveSocket(isBroadcaster ? { sessionId } : undefined);
 
   /* ── core state ── */
   const [sessionData, setSessionData] = useState<any>(null);
@@ -400,7 +600,6 @@ export default function LiveSessionViewPage() {
   const [isLiked, setIsLiked] = useState(false);
   const [likeAnimCount, setLikeAnimCount] = useState(0);
   const [giftNotification, setGiftNotification] = useState<{ type: 'received' | 'request'; giftName?: string; fromName?: string; price?: number } | null>(null);
-  const [dakshinaRequestModal, setDakshinaRequestModal] = useState<{ gift?: any; visible: boolean }>({ visible: false });
   const [showGiftModal, setShowGiftModal] = useState(false);
   const [showCallTypeModal, setShowCallTypeModal] = useState(false);
 
@@ -437,6 +636,21 @@ export default function LiveSessionViewPage() {
   // delayed `call_end` with reason `RING_TIMEOUT` that can still fire if we
   // had to bypass `accept_invite` (e.g. channelId was never surfaced to us).
   const inCallSinceRef = useRef<number>(0);
+  
+  // Predictable channelId fallback: stores the user's current queue item ID
+  // so we can reconstruct the broadcaster's channelId perfectly if the backend
+  // fails to broadcast it.
+  const myQueueItemIdRef = useRef<string | null>(null);
+
+  // Host invite tracking — set when the broadcaster emits send_invite, cleared
+  // on matching call_started / call_end. Mirrors Swift's invitedQueueUserId +
+  // invitedUserName so we can show "<name> declined your call invitation."
+  const invitedQueueUserIdRef = useRef<string | null>(null);
+  const invitedUserNameRef = useRef<string | null>(null);
+
+  // Viewer-side: mute remote audio while another viewer is in a *private*
+  // call with the host. Mirrors Swift's unSubscribeAudioForSelf branch.
+  const [mutedRemoteAudio, setMutedRemoteAudio] = useState(false);
 
   /* ════════════════════════════════════════════════════════════════════ */
   /*  Data fetchers                                                      */
@@ -505,7 +719,7 @@ export default function LiveSessionViewPage() {
 
     setIsSendingGift(true);
     try {
-      await emitSendGift(sessionId, gift, broadcasterName, receiverUserId);
+      await emitSendGift(sessionId, gift, receiverUserId);
 
       // Optimistic UI — balance/notification update immediately, then a
       // server-side balance refresh reconciles in the background.
@@ -562,40 +776,22 @@ export default function LiveSessionViewPage() {
 
       let channelId: string | null = myCall?.channelId || inviteCallData?.channelId || null;
 
-      // If we don't have a channelId yet, retry the fresh fetch a couple of
-      // times — Redis may not have surfaced the activeCall in the same instant
-      // the queue entry disappeared. We need a real channelId before emitting
-      // accept_invite, otherwise the backend can't cancel the ring timer or
-      // emit call_started.
-      if (!channelId) {
-        for (let attempt = 0; attempt < 4 && !channelId; attempt++) {
-          try {
-            const fresh = await getActiveCall(sessionId);
-            if (fresh?.channelId) {
-              channelId = fresh.channelId;
-              dlog('accept: fresh activeCall fetch ->', fresh, 'attempt', attempt);
-              break;
-            }
-            // small backoff before next attempt
-            await new Promise(r => setTimeout(r, 250));
-          } catch (e) {
-            console.warn('[LiveCall] fresh getActiveCall failed:', e);
-            await new Promise(r => setTimeout(r, 250));
-          }
-        }
-      }
-
+      // We no longer poll getActiveCall here if channelId is missing. The backend
+      // sometimes fails to save activeCall to Redis in time, leading to a useless
+      // 2-second UX delay. We now rely on the 'onSendInvite' socket listener to
+      // get the channelId instantly, or the broadcaster's own accept_invite
+      // fallback when we connect to the LiveKit room.
       dlog('accept: channelId=', channelId, 'callType=', callType, 'myCall=', myCall);
 
-      // Always emit accept_invite when the user accepts. Backend uses this to
-      // cancel the ring timer and broadcast `call_started` to the session
-      // room — without it, the call may RING_TIMEOUT mid-conversation.
-      // We send whatever channelId we have; the backend handler logs/no-ops
-      // if the value is missing rather than crashing.
+      // Always emit accept_invite. If channelId is still empty, the backend
+      // can't bind the call and `call_started` won't broadcast — the call
+      // still works at the LiveKit layer (audio publishes both ways) but the
+      // broadcaster's in-call UI relies on the broadcast and may stay stale.
+      // Logged loudly so this is visible in server diagnostics.
       const ackAccept = await acceptInvite(sessionId, channelId || '');
       dlog('accept_invite ack:', ackAccept);
       if (!channelId) {
-        console.warn('[LiveCall] accept_invite emitted without channelId — ring timer may not cancel.');
+        dlog('No channelId locally. Emitting with empty id; broadcaster fallback will handle call_started when we join the room.');
       }
 
       const isPrivateAudio = callType === 'private';
@@ -732,7 +928,10 @@ export default function LiveSessionViewPage() {
     setCallWsUrl(null);
     setCallChannelId(null);
     setCallTimer(0);
-    setIsMuted(false);
+    inCallWithRef.current = null;
+    // Don't reset mute on the broadcaster — their mute applies to the live
+    // stream itself, not just the call. Viewer-side mute is in-call only.
+    if (!isBroadcaster) setIsMuted(false);
     setInQueue(false);
     setQueueType(null);
 
@@ -805,8 +1004,15 @@ export default function LiveSessionViewPage() {
                 : !!ac?.isPrivate;
               const cType: 'private' | 'public' =
                 (detectedIsPrivate || queueType === 'private') ? 'private' : 'public';
+              
+              // Construct the highly-predictable channelId since we know the broadcaster
+              // used our queue item's ID to build it.
+              const predictedChannelId = myQueueItemIdRef.current 
+                ? `live-call-${sessionId}-${myQueueItemIdRef.current}`
+                : null;
+                
               setInviteCallData({
-                channelId: ac?.channelId || null,
+                channelId: ac?.channelId || predictedChannelId,
                 sessionId,
                 userId: myId,
                 isPrivate: detectedIsPrivate || queueType === 'private',
@@ -817,6 +1023,7 @@ export default function LiveSessionViewPage() {
             });
           }
           myQueuePresenceRef.current = isPresentNow;
+          if (isPresentNow) myQueueItemIdRef.current = mineNow._id;
         }
       } catch (err) {
         console.error('[LiveSession] Queue poll failed:', err);
@@ -906,21 +1113,44 @@ export default function LiveSessionViewPage() {
     const init = async () => {
       setLoading(true);
       try {
-        const resp = await joinSession(sessionId);
-        if (resp?.error) {
-          setError(resp.status === 'ended' ? 'This session has ended.' : 'Session not found or has ended.');
-          setLoading(false);
-          return;
-        }
-        if (resp?.data) {
-          setSessionData(resp.data);
-          if (resp.data.maxViewers) setViewers(Number(resp.data.maxViewers) || 0);
-        }
+        if (isBroadcaster && broadcasterCache) {
+          /* ── Broadcaster path ──
+             We're already inside the session room (joined by the backend in
+             `startSession`). Reuse the publisher token from sessionStorage —
+             do NOT call `fetchSessionToken` here, which mints a viewer
+             token without publish permissions. */
+          setSessionData({
+            sessionId,
+            broadcasterId: broadcasterCache.broadcasterId,
+            broadcasterName: broadcasterCache.broadcasterName,
+            broadcasterProfilePicture: broadcasterCache.broadcasterProfilePicture,
+            status: 'live',
+          });
+          setLivekitToken(broadcasterCache.token);
+          setLivekitUrl(broadcasterCache.livekitSocketURL);
+        } else {
+          /* ── Viewer path ── */
+          const resp = await joinSession(sessionId);
+          if (resp?.error) {
+            // joinSession now returns `{error:true, code:'SESSION_ENDED'}` for
+            // the ended-session shape and `{error:true, code:'JOIN_FAILED'}`
+            // otherwise. Fall back to the legacy `status==='ended'` check for
+            // any direct error responses.
+            const ended = resp.code === 'SESSION_ENDED' || resp.status === 'ended' || resp.raw?.status === 'ended';
+            setError(ended ? 'This session has ended.' : 'Session not found or has ended.');
+            setLoading(false);
+            return;
+          }
+          if (resp?.data) {
+            setSessionData(resp.data);
+            if (resp.data.maxViewers) setViewers(Number(resp.data.maxViewers) || 0);
+          }
 
-        const tokenResp = await fetchSessionToken(sessionId);
-        if (tokenResp && !tokenResp.error && tokenResp.data) {
-          setLivekitToken(tokenResp.data.currentSessionToken);
-          setLivekitUrl(tokenResp.data.livekitSocketURL);
+          const tokenResp = await fetchSessionToken(sessionId);
+          if (tokenResp && !tokenResp.error && tokenResp.data) {
+            setLivekitToken(tokenResp.data.currentSessionToken);
+            setLivekitUrl(tokenResp.data.livekitSocketURL);
+          }
         }
 
         const [chatData, queueData, activeCallData, likesData] = await Promise.all([
@@ -950,18 +1180,31 @@ export default function LiveSessionViewPage() {
 
     init();
     return () => {
-      leaveSession(sessionId);
+      // Viewers explicitly leave the session so backend updates the viewer
+      // count immediately. Broadcasters don't call leaveSession — they own
+      // the session and end it via the explicit "End Session" control or
+      // by socket disconnect (backend's 30s timer fires `endSession`).
+      if (!isBroadcaster) {
+        leaveSession(sessionId);
+      }
       // Refresh header wallet now that the live session is ending.
       if (typeof window !== 'undefined') {
         window.dispatchEvent(new Event('wallet-balance-refresh'));
       }
     };
-  }, [isConnected, sessionId]);
+  }, [isConnected, sessionId, isBroadcaster]);
 
   /* ── real-time listeners ── */
   useEffect(() => {
     if (!isConnected) return;
     const unsubs = [
+      onSessionStarted((d: any) => {
+        // Confirmation that the backend has fully provisioned the session.
+        // Useful for the broadcaster to know they're truly live, and for
+        // viewers who hit the page during the brief "starting" window.
+        console.log('[LiveSession] sessionStarted:', d);
+        setSessionData((prev: any) => ({ ...(prev || {}), status: 'live' }));
+      }),
       onChatUpdate((msg: ChatMessage) => setChats(prev => [...prev, msg])),
       onViewerUpdate((d: any) => {
         // Backends vary in the field name used for live viewer counts. Accept
@@ -990,43 +1233,64 @@ export default function LiveSessionViewPage() {
         setActiveCall(callData);
         const myId = getMyId();
 
-        if (callData && (
+        const isPrivate = typeof callData?.isPrivate === 'string'
+          ? callData.isPrivate === 'true'
+          : !!callData?.isPrivate;
+
+        // Broadcaster path: backend confirmed the user accepted. Flip into
+        // in-call mode so the top-bar timer + End-Call button render. The
+        // user-side branch below stays gated on the modal because viewers
+        // need to opt in (mic permission, balance check) before joining.
+        const isMineAsBroadcaster = !!callData && isBroadcaster && (
+          sameId(callData.broadcasterId, myId) ||
+          sameId(callData.partnerId, myId) ||
+          callData.sessionId === sessionId
+        );
+        if (isMineAsBroadcaster) {
+          // The user we just invited has accepted. Clear the queueId ref so a
+          // later `call_end` is read as a normal hang-up (not a decline). Keep
+          // invitedUserNameRef populated so the in-call banner can display
+          // "with <name>" even when call_started's payload omits userName.
+          invitedQueueUserIdRef.current = null;
+          if (callData?.userName) invitedUserNameRef.current = callData.userName;
+          setCallChannelId(callData.channelId || null);
+          setInviteCallType(isPrivate ? 'private' : 'public');
+          inCallSinceRef.current = Date.now();
+          setIsInCall(true);
+          setCallTimer(0);
+          if (callTimerRef.current) clearInterval(callTimerRef.current);
+          callTimerRef.current = setInterval(() => setCallTimer(p => p + 1), 1000);
+          return;
+        }
+
+        const isForMe = !!callData && (
           sameId(callData.userId, myId) ||
           sameId(callData.callerId, myId) ||
           sameId(callData.user?._id, myId) ||
           sameId(callData.receiverId, myId) ||
           sameId(callData.receiverUserId, myId)
-        )) {
+        );
+
+        if (isForMe) {
           setCallChannelId(callData.channelId || null);
-          const isPrivate = typeof callData.isPrivate === 'string'
-            ? callData.isPrivate === 'true'
-            : !!callData.isPrivate;
 
           // INSTEAD of auto-accepting, show modal
           setInviteCallData(callData);
           setInviteCallType(isPrivate ? 'private' : 'public');
           setShowInviteModal(true);
+          return;
         }
-      }),
-      onInviteReceived((payload: any) => {
-        dlog('onInviteReceived:', payload);
-        if (!payload) return;
-        const myId = getMyId();
-        // Accept the invite only if it is targeted at this viewer. Server may
-        // put the target id in any of several fields; be liberal.
-        const targetedAtMe =
-          sameId(payload.userId, myId) ||
-          sameId(payload.receiverId, myId) ||
-          sameId(payload.receiverUserId, myId) ||
-          sameId(payload.user?._id, myId);
-        if (!targetedAtMe) return;
-        const isPrivate = typeof payload.isPrivate === 'string'
-          ? payload.isPrivate === 'true'
-          : !!payload.isPrivate;
-        const cType: 'private' | 'public' = (isPrivate || queueType === 'private') ? 'private' : 'public';
-        setInviteCallData(payload);
-        setInviteCallType(cType);
-        setShowInviteModal(true);
+
+        // Match Swift: someone *else* is in a call with the host.
+        //   - private → mute remote audio so other viewers can't eavesdrop.
+        //   - public  → keep audio (anyone watching can hear the conversation).
+        if (!isBroadcaster) {
+          if (isPrivate) {
+            setMutedRemoteAudio(true);
+          } else {
+            setMutedRemoteAudio(false);
+          }
+        }
       }),
       onCallEnd((d: any) => {
         dlog('onCallEnd payload:', d);
@@ -1058,11 +1322,39 @@ export default function LiveSessionViewPage() {
           alert('You missed the astrologer\'s call invitation. Please rejoin the queue to try again.');
         }
         setActiveCall(null);
+        // Restore remote audio for any viewer who had it muted because someone
+        // else was in a private call with the host (matches Swift's
+        // resubscribeAudioForSelf path on the rejection branch).
+        setMutedRemoteAudio(false);
+
+        // Host-side decline branch (Swift: onCallRejected → invitedQueueUserId).
+        // If we (host) are still idle and were waiting on a specific invitee
+        // to accept, this `call_end` means they declined. Show a targeted toast
+        // and remove that queue entry.
+        if (isBroadcaster && !isInCall && invitedQueueUserIdRef.current) {
+          const declinedQueueId = invitedQueueUserIdRef.current;
+          const declinedName = invitedUserNameRef.current || 'User';
+          invitedQueueUserIdRef.current = null;
+          invitedUserNameRef.current = null;
+          setQueue(prev => prev.filter(q => q._id !== declinedQueueId));
+          setGiftNotification({
+            type: 'request',
+            giftName: `${declinedName} declined your call invitation.`,
+            fromName: declinedName,
+          });
+          setTimeout(() => setGiftNotification(null), 3500);
+        } else if (isBroadcaster && !isInCall) {
+          // Generic "Call Ended" (Swift else-branch toast).
+          setGiftNotification({ type: 'request', giftName: 'Call Ended' });
+          setTimeout(() => setGiftNotification(null), 2500);
+        }
+
         // If we were in an active call from our perspective, terminate.
         if (isInCall) {
           if (callTimerRef.current) { clearInterval(callTimerRef.current); callTimerRef.current = null; }
           setIsInCall(false);
           inCallSinceRef.current = 0;
+          invitedUserNameRef.current = null;
           setCallToken(null);
           setCallWsUrl(null);
           setCallChannelId(null);
@@ -1074,7 +1366,50 @@ export default function LiveSessionViewPage() {
         }
         getQueue(sessionId).then(q => setQueue(Array.isArray(q) ? q : []));
       }),
-      onQueueJoined((d: any) => { if (d.data) setQueue(Array.isArray(d.data) ? d.data : []); }),
+      onSendInvite((d: any) => {
+        dlog('onSendInvite received:', d);
+        if (isInCall || isJoiningCall) return;
+        
+        const myId = getMyId();
+        const inviteData = d?.sessionCall || d;
+        if (sameId(inviteData?.userId, myId) || sameId(inviteData?.invitedUserId, myId)) {
+          const detectedIsPrivate = typeof inviteData?.isPrivate === 'string'
+            ? inviteData.isPrivate === 'true'
+            : !!inviteData?.isPrivate;
+          const cType: 'private' | 'public' = (detectedIsPrivate || queueType === 'private') ? 'private' : 'public';
+          
+          setInviteCallData((prev: any) => ({
+            ...prev,
+            channelId: inviteData?.channelId || prev?.channelId || null,
+            sessionId,
+            userId: myId,
+            isPrivate: detectedIsPrivate || queueType === 'private',
+            _source: 'socket-send_invite',
+          }));
+          setInviteCallType(cType);
+          setShowInviteModal(true);
+        }
+      }),
+      onQueueJoined((d: any) => {
+        // Match Swift: append only entries we don't already have, toast the
+        // first new joiner, do not wipe the existing queue.
+        const incoming: any[] = Array.isArray(d?.data) ? d.data : [];
+        if (incoming.length === 0) return;
+        setQueue(prev => {
+          const existingIds = new Set(prev.map(q => q._id));
+          const newOnes = incoming.filter((u: any) => u?._id && !existingIds.has(u._id));
+          if (newOnes.length > 0) {
+            const firstName = newOnes[0]?.userName || 'User';
+            setGiftNotification({
+              type: 'request',
+              giftName: `${firstName} joined the call queue`,
+              fromName: firstName,
+            });
+            setTimeout(() => setGiftNotification(null), 2500);
+          }
+          return [...prev, ...newOnes];
+        });
+      }),
       onLikeUpdate((d: any) => {
         if (d.data?.totalLikes !== undefined) {
           setLikes(prev => {
@@ -1085,16 +1420,17 @@ export default function LiveSessionViewPage() {
           });
         }
       }),
-      onGiftReceived((d: any) => { 
+      onGiftReceived((d: any) => {
         setGiftNotification({ type: 'received', giftName: d.giftName, fromName: d.fromName, price: d.price });
         setTimeout(() => setGiftNotification(null), 3500);
       }),
-      onGiftRequest((d: any) => {
-        setDakshinaRequestModal({ gift: d.gift, visible: true });
-      }),
+      // Mirrors Swift's onGiftRequest hookup. Currently a log-only placeholder
+      // (Swift does the same) — kept to keep the listener surface in parity so
+      // future host-side gift-confirmation UI can hang off the same event.
+      onGiftRequest((d: any) => { dlog('gift_request:', d); }),
     ];
     return () => unsubs.forEach(u => { if (typeof u === 'function') u(); });
-  }, [isConnected, sessionId, isInCall, queueType]);
+  }, [isConnected, sessionId, isInCall, queueType, isBroadcaster]);
 
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [chats]);
 
@@ -1208,6 +1544,147 @@ export default function LiveSessionViewPage() {
   };
 
   /* ════════════════════════════════════════════════════════════════════ */
+  /*  Broadcaster handlers                                                */
+  /* ════════════════════════════════════════════════════════════════════ */
+  const [endingSession, setEndingSession] = useState(false);
+  const [showQueuePanel, setShowQueuePanel] = useState(false);
+  const [invitingUserIds, setInvitingUserIds] = useState<Set<string>>(new Set());
+  const [showEndConfirm, setShowEndConfirm] = useState(false);
+  // Pending invites the broadcaster has sent, keyed by invitee userId. Used to
+  // match LiveKit participantConnected events to a known call (channelId +
+  // isPrivate) when the backend's call_started socket broadcast doesn't fire.
+  const pendingInvitesRef = useRef<Map<string, { channelId: string; isPrivate: boolean; userName: string }>>(new Map());
+  // Identity of the viewer currently in-call with this broadcaster, so we can
+  // detect their disconnect and tear down the broadcaster's in-call UI.
+  const inCallWithRef = useRef<string | null>(null);
+
+  // Broadcaster: invite a queued user. Generates a fresh `channelId` on the
+  // frontend (the same id is later persisted by the backend and surfaced
+  // through `accept_invite` / `call_started`) and emits `send_invite`.
+  const handleInviteUser = useCallback(async (queueItem: QueueItem) => {
+    if (!isBroadcaster) return;
+    if (invitingUserIds.has(queueItem.userId)) return;
+    setInvitingUserIds(prev => new Set(prev).add(queueItem.userId));
+    try {
+      // Use the queueItem's unique ID so the channelId becomes fully predictable
+      // for the viewer, in case the backend's socket broadcast drops.
+      const channelId = `live-call-${sessionId}-${queueItem._id}`;
+      const resp = await emitSendInvite({
+        sessionId,
+        channelId,
+        queueId: queueItem._id,
+        userId: queueItem.userId,
+        isPrivate: !!queueItem.isPrivate,
+      });
+      if (resp?.error) {
+        alert(resp.message || 'Failed to invite user. Please try again.');
+        return;
+      }
+      // Record the invite so when this user appears in the LiveKit room (or
+      // backend broadcasts call_started) we can flip into in-call UI with
+      // the correct call type and channelId without needing the broadcast
+      // to carry it.
+      pendingInvitesRef.current.set(String(queueItem.userId), {
+        channelId,
+        isPrivate: !!queueItem.isPrivate,
+        userName: queueItem.userName || '',
+      });
+      // Track the *queueId* + name so onCallEnd can distinguish an
+      // outright decline from a generic "Call Ended" (Swift parity).
+      invitedQueueUserIdRef.current = queueItem._id;
+      invitedUserNameRef.current = queueItem.userName || 'User';
+      console.log('[Broadcaster] Invite sent for', queueItem.userName, 'channelId=', channelId);
+    } catch (err: any) {
+      console.error('[Broadcaster] send_invite failed:', err);
+      alert(err?.message || 'Failed to invite user.');
+    } finally {
+      setInvitingUserIds(prev => {
+        const next = new Set(prev);
+        next.delete(queueItem.userId);
+        return next;
+      });
+    }
+  }, [isBroadcaster, sessionId, emitSendInvite, invitingUserIds]);
+
+  // Broadcaster: a viewer joined the LiveKit room. If we have a pending
+  // invite for them, the backend's `accept_invite` likely succeeded — but
+  // `call_started` may not have fired (when activeCall isn't persisted with
+  // a channelId, getSessionCall returns null and the broadcast is skipped).
+  // Use this as a fallback trigger so the broadcaster's in-call UI renders.
+  const handleBroadcasterParticipantConnected = useCallback((identity: string) => {
+    if (!isBroadcaster) return;
+    if (isInCall) return; // already in a call
+    const meta = pendingInvitesRef.current.get(String(identity));
+    if (!meta) {
+      // Unknown participant — ignore. They may be a passive viewer that
+      // joined via `joinSession` (different LiveKit grants don't publish).
+      return;
+    }
+    console.log('[Broadcaster] Pending invitee joined room — entering in-call state for', identity);
+
+    // ── Broadcaster-side accept_invite guarantee ──
+    // The user's own `accept_invite` may have fired with an empty channelId
+    // (Redis hadn't surfaced the activeCall in time), which means the backend
+    // never transitioned the call state and `call_started` never broadcast.
+    // We know the real channelId (we generated it in handleInviteUser), so
+    // emit accept_invite from the broadcaster's socket. The backend handler
+    // doesn't validate *who* emits it — it just looks up the call by
+    // channelId, cancels the ring timer, and broadcasts `call_started`.
+    if (meta.channelId) {
+      console.log('[Broadcaster] Emitting accept_invite on behalf of joined user, channelId=', meta.channelId);
+      acceptInvite(sessionId, meta.channelId)
+        .then(ack => console.log('[Broadcaster] accept_invite ack:', ack))
+        .catch(err => console.warn('[Broadcaster] accept_invite failed (non-fatal):', err));
+    }
+
+    inCallWithRef.current = String(identity);
+    setCallChannelId(meta.channelId);
+    setInviteCallType(meta.isPrivate ? 'private' : 'public');
+    inCallSinceRef.current = Date.now();
+    setIsInCall(true);
+    setCallTimer(0);
+    if (callTimerRef.current) clearInterval(callTimerRef.current);
+    callTimerRef.current = setInterval(() => setCallTimer(p => p + 1), 1000);
+    pendingInvitesRef.current.delete(String(identity));
+  }, [isBroadcaster, isInCall, acceptInvite, sessionId]);
+
+  const handleBroadcasterParticipantDisconnected = useCallback((identity: string) => {
+    if (!isBroadcaster) return;
+    if (inCallWithRef.current && String(inCallWithRef.current) === String(identity)) {
+      console.log('[Broadcaster] In-call viewer disconnected — tearing down in-call UI');
+      if (callTimerRef.current) { clearInterval(callTimerRef.current); callTimerRef.current = null; }
+      setIsInCall(false);
+      inCallSinceRef.current = 0;
+      invitedUserNameRef.current = null;
+      setCallChannelId(null);
+      setCallTimer(0);
+      inCallWithRef.current = null;
+    }
+  }, [isBroadcaster]);
+
+  // Broadcaster: end the session. Clears the cache + redirects back.
+  const handleEndBroadcasterSession = useCallback(async () => {
+    if (!isBroadcaster || endingSession) return;
+    setEndingSession(true);
+    try {
+      // If the broadcaster is in an active call with a viewer, end that
+      // first so the participant gets a clean `call_end` before the room
+      // tears down. Avoids an awkward "RING_TIMEOUT" race on the viewer.
+      if (callChannelId) {
+        try { await endCall(sessionId, callChannelId); } catch {}
+      }
+      await endSessionBroadcaster(sessionId);
+    } catch (err) {
+      console.error('[Broadcaster] endSession failed:', err);
+    } finally {
+      // Always clear the cache + navigate, even if the socket emit failed —
+      // the backend's 30s disconnect timer will end the session anyway.
+      try { sessionStorage.removeItem(`liveBroadcaster:${sessionId}`); } catch {}
+      router.push('/dashboard/partner');
+    }
+  }, [isBroadcaster, endingSession, callChannelId, sessionId, endCall, endSessionBroadcaster, router]);
+
+  /* ════════════════════════════════════════════════════════════════════ */
   /*  LOADING                                                            */
   /* ════════════════════════════════════════════════════════════════════ */
   if (loading) {
@@ -1279,24 +1756,47 @@ export default function LiveSessionViewPage() {
             // Remount (disconnect + reconnect with fresh grants) whenever we
             // cross the viewer↔caller phase boundary. @livekit/components-react
             // does not reconnect on token/url prop change alone.
-            key={isInCall && callToken ? `call-${callChannelId || sessionId}` : `view-${sessionId}`}
+            key={isInCall && callToken ? `call-${callChannelId || sessionId}` : isBroadcaster ? `broad-${sessionId}` : `view-${sessionId}`}
             serverUrl={isInCall && callWsUrl ? callWsUrl : livekitUrl}
             token={isInCall && callToken ? callToken : livekitToken}
             connect={true}
-            audio={isInCall && !isMuted}
-            video={false}
+            audio={isBroadcaster ? !isMuted : isInCall && !isMuted}
+            video={isBroadcaster}
           >
-            <BroadcasterVideo broadcasterName={broadcasterName} broadcasterAvatar={broadcasterAvatar} />
-            <RoomAudioRenderer />
-            <AudioPlaybackUnlocker />
-            <CallRoomController
-              isInCall={isInCall}
-              isMuted={isMuted}
-              onConnected={() => {
-                dlog('CallRoomController onConnected -> emitConnectedWithLivekit');
-                emitConnectedWithLivekit(sessionId, false);
-              }}
-            />
+            {isBroadcaster ? (
+              <>
+                <BroadcasterSelfPreview broadcasterName={broadcasterName} broadcasterAvatar={broadcasterAvatar} />
+                <BroadcasterPublishController
+                  isMuted={isMuted}
+                  onConnected={() => {
+                    console.log('[Broadcaster] onConnected -> emitConnectedWithLivekit');
+                    emitConnectedWithLivekit(sessionId, false);
+                  }}
+                  onRemoteParticipantConnected={handleBroadcasterParticipantConnected}
+                  onRemoteParticipantDisconnected={handleBroadcasterParticipantDisconnected}
+                />
+                {/* Audio renderer for viewers calling in (broadcaster hears them). */}
+                <RoomAudioRenderer />
+              </>
+            ) : (
+              <>
+                <BroadcasterVideo broadcasterName={broadcasterName} broadcasterAvatar={broadcasterAvatar} />
+                {/* Mute remote audio when another viewer is in a *private* call
+                    with the host (Swift: unSubscribeAudioForSelf). Volume 0
+                    keeps the audio element alive (avoids autoplay re-locks)
+                    while preventing eavesdropping. */}
+                <RoomAudioRenderer volume={mutedRemoteAudio ? 0 : 1} />
+                <AudioPlaybackUnlocker />
+                <CallRoomController
+                  isInCall={isInCall}
+                  isMuted={isMuted}
+                  onConnected={() => {
+                    dlog('CallRoomController onConnected -> emitConnectedWithLivekit');
+                    emitConnectedWithLivekit(sessionId, false);
+                  }}
+                />
+              </>
+            )}
           </LiveKitRoom>
         ) : (
           <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-b from-orange-50 via-white to-amber-50/40">
@@ -1321,47 +1821,31 @@ export default function LiveSessionViewPage() {
           <button onClick={() => { window.location.href = '/live-sessions'; }} className="w-9 h-9 rounded-full bg-white shadow-md border border-orange-100 flex items-center justify-center text-orange-600 active:scale-90 transition-transform">
             <ArrowLeft className="w-4 h-4" />
           </button>
-          <div className={`premium-glass rounded-2xl pl-0.5 pr-3.5 py-0.5 shadow-sm border-white/40 ${isInCall ? 'pb-1.5' : ''}`}>
-            <div className="flex items-center gap-2">
-              <div className="w-8 h-8 rounded-full p-[2px] bg-gradient-to-br from-orange-500 via-amber-500 to-yellow-500">
-                <div className="w-full h-full rounded-full overflow-hidden bg-white">
-                  {broadcasterAvatar ? (
-                    <img src={broadcasterAvatar} alt={broadcasterName} className="w-full h-full object-cover" />
-                  ) : (
-                    <div className="w-full h-full bg-gradient-to-br from-orange-400 to-amber-500 flex items-center justify-center">
-                      <span className="text-white text-[10px] font-bold uppercase">{broadcasterName?.charAt(0)}</span>
-                    </div>
-                  )}
+          <div className="flex flex-col items-start gap-1">
+            <div className="premium-glass rounded-2xl pl-0.5 pr-3.5 py-0.5 shadow-sm border-white/40">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-full p-[2px] bg-gradient-to-br from-orange-500 via-amber-500 to-yellow-500">
+                  <div className="w-full h-full rounded-full overflow-hidden bg-white">
+                    {broadcasterAvatar ? (
+                      <img src={broadcasterAvatar} alt={broadcasterName} className="w-full h-full object-cover" />
+                    ) : (
+                      <div className="w-full h-full bg-gradient-to-br from-orange-400 to-amber-500 flex items-center justify-center">
+                        <span className="text-white text-[10px] font-bold uppercase">{broadcasterName?.charAt(0)}</span>
+                      </div>
+                    )}
+                  </div>
                 </div>
-              </div>
-              <div className="leading-none">
-                <p className="text-gray-900 text-[12px] font-extrabold tracking-tight">{broadcasterName}</p>
-                <div className="flex items-center gap-1 mt-0.5">
-                  <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
-                  <p className="text-orange-600 text-[9px] font-black uppercase tracking-widest">{viewers} online</p>
+                <div className="leading-none">
+                  <p className="text-gray-900 text-[12px] font-extrabold tracking-tight">{broadcasterName}</p>
+                  <div className="flex items-center gap-1 mt-0.5">
+                    <div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" />
+                    <p className="text-orange-600 text-[9px] font-black uppercase tracking-widest">{viewers} online</p>
+                  </div>
                 </div>
               </div>
             </div>
-
-            {/* Call type + timer — only while in an active call. Sits directly
-                under the broadcaster name so both the user and the astrologer
-                can see the active-call status at a glance. */}
-            {isInCall && (
-              <div className="mt-1.5 ml-10 flex items-center gap-1.5 animate-fade-in-up">
-                <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-extrabold uppercase tracking-wider shadow-sm ${
-                  inviteCallType === 'private'
-                    ? 'bg-gradient-to-r from-purple-500 to-fuchsia-500 text-white'
-                    : 'bg-gradient-to-r from-green-500 to-emerald-500 text-white'
-                }`}>
-                  <span className="w-1.5 h-1.5 bg-white rounded-full animate-pulse" />
-                  {inviteCallType === 'private' ? '🔒 Private Call' : '🌐 Public Call'}
-                </span>
-                <span className="text-gray-800 text-[11px] font-extrabold tabular-nums">
-                  {formatTime(callTimer)}
-                  {callSessionTime > 0 && <span className="text-gray-400 font-semibold"> / {formatTime(callSessionTime)}</span>}
-                </span>
-              </div>
-            )}
+            {/* Full-width in-call banner is rendered separately below the
+                top bar (single source of truth) — no duplicate chip here. */}
           </div>
         </div>
 
@@ -1383,6 +1867,25 @@ export default function LiveSessionViewPage() {
                 aria-label="End call"
               >
                 <PhoneOff className="w-4 h-4" />
+              </button>
+            </>
+          ) : isBroadcaster ? (
+            <>
+              <button
+                onClick={() => setIsMuted(!isMuted)}
+                className={`w-9 h-9 rounded-full flex items-center justify-center shadow-md transition-all active:scale-90 ${
+                  isMuted ? 'bg-red-500 text-white' : 'bg-white border border-orange-100 text-orange-600'
+                }`}
+                aria-label={isMuted ? 'Unmute' : 'Mute'}
+              >
+                {isMuted ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+              </button>
+              <button
+                onClick={() => setShowEndConfirm(true)}
+                className="w-9 h-9 rounded-full bg-red-500 text-white flex items-center justify-center shadow-md shadow-red-500/30 active:scale-90 transition-transform"
+                aria-label="End session"
+              >
+                <StopCircle className="w-4 h-4" />
               </button>
             </>
           ) : (
@@ -1412,6 +1915,37 @@ export default function LiveSessionViewPage() {
               {activeCall.isPrivate ? '🔒 Private' : '🌐 Public'} call in progress
               {activeCall.userName && <span className="text-orange-600 font-extrabold ml-1">with {activeCall.userName}</span>}
             </span>
+          </div>
+        </div>
+      )}
+
+      {/* ═══════ IN-CALL BANNER ═══════ */}
+      {/* Rendered for whichever side is in an active call on the web. The
+          mobile astrologer apps (iOS Swift / Android Kotlin) ship their own
+          version of this UI; we don't have access to those repos, so this
+          web banner is the only surface we can control from here. It serves
+          both web users (talking to a mobile astrologer) AND web partners
+          who go live via the partner panel (StatusToggle → broadcaster mode). */}
+      {isInCall && (
+        <div className="relative z-10 mx-3 mt-1 animate-fade-in-up">
+          <div className={`flex items-center justify-between gap-3 rounded-2xl px-4 py-2.5 shadow-lg ${
+            inviteCallType === 'private'
+              ? 'bg-gradient-to-r from-purple-600 to-fuchsia-600 text-white border border-purple-300/60'
+              : 'bg-gradient-to-r from-emerald-600 to-green-600 text-white border border-emerald-300/60'
+          }`}>
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="w-2 h-2 bg-white rounded-full animate-pulse" />
+              <span className="text-[12px] font-black uppercase tracking-wider">
+                {inviteCallType === 'private' ? '🔒 Private Call' : '🌐 Public Call'}
+              </span>
+              <span className="opacity-70">·</span>
+              <span className="text-[12px] font-semibold truncate">
+                {isBroadcaster
+                  ? `with ${activeCall?.userName || invitedUserNameRef.current || 'User'}`
+                  : `with ${broadcasterName}`}
+              </span>
+            </div>
+            <span className="text-[14px] font-extrabold tabular-nums shrink-0">{formatTime(callTimer)}</span>
           </div>
         </div>
       )}
@@ -1447,7 +1981,20 @@ export default function LiveSessionViewPage() {
           <span className="text-[#FFD200] text-[10px] font-black tracking-widest uppercase drop-shadow-md">Dakshina</span>
         </button>
 
-        {!inQueue && !isWaitlisted && !isInCall && (
+        {/* Broadcaster: toggle queue panel */}
+        {isBroadcaster && !isInCall && (
+          <button
+            onClick={() => setShowQueuePanel(!showQueuePanel)}
+            className="group flex flex-col items-center gap-1.5 transition-all"
+          >
+            <div className={`w-14 h-14 rounded-full flex items-center justify-center shadow-[0_8px_32px_rgba(0,0,0,0.3)] group-hover:scale-110 transition-all duration-500 border-2 ${showQueuePanel ? 'bg-orange-500 border-white/40' : 'bg-white/10 border-white/20 hover:bg-white/20 hover:border-white/40'}`}>
+              <Users className="w-7 h-7 text-white drop-shadow-md" />
+            </div>
+            <span className="text-white text-[10px] font-black tracking-widest uppercase drop-shadow-md">Queue</span>
+          </button>
+        )}
+
+        {!inQueue && !isWaitlisted && !isInCall && !isBroadcaster && (
           <button
             onClick={() => setShowCallTypeModal(true)}
             disabled={joiningQueue}
@@ -1723,45 +2270,6 @@ export default function LiveSessionViewPage() {
         </div>
       )}
 
-      {/* ═══════ DAKSHINA REQUEST MODAL ═══════ */}
-      {dakshinaRequestModal.visible && (
-        <div className="fixed inset-0 z-[300] flex items-center justify-center px-6">
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-md" onClick={() => setDakshinaRequestModal({ visible: false })} />
-          <div className="relative w-full max-w-sm bg-gradient-to-b from-[#2a1545] to-[#1a0e2e] rounded-3xl border border-white/10 shadow-2xl overflow-hidden animate-scale-in">
-            <div className="px-6 pt-7 pb-4 text-center">
-              <div className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-gradient-to-br from-purple-500/20 to-indigo-600/20 border-2 border-purple-400/30 mb-4">
-                {dakshinaRequestModal.gift?.icon ? (
-                  <img src={dakshinaRequestModal.gift.icon} alt="gift" className="w-9 h-9 object-contain" />
-                ) : (
-                  <Gift className="w-8 h-8 text-purple-300" />
-                )}
-              </div>
-              <h3 className="text-lg font-bold text-white mb-1">Dakshina Requested</h3>
-              <p className="text-white/50 text-sm">
-                {broadcasterName} has requested{' '}
-                <span className="text-amber-300">{dakshinaRequestModal.gift?.name || 'Dakshina'}</span>
-                {dakshinaRequestModal.gift?.price && (
-                  <span className="text-amber-300 font-semibold"> (₹{dakshinaRequestModal.gift.price})</span>
-                )}
-              </p>
-            </div>
-            <div className="px-6 pb-7 flex gap-3">
-              <button onClick={() => setDakshinaRequestModal({ visible: false })} className="flex-1 py-3.5 rounded-2xl bg-white/[0.06] border border-white/[0.08] text-white/60 text-sm font-semibold hover:bg-white/[0.1] transition-all active:scale-[0.97]">
-                Decline
-              </button>
-              <button onClick={async () => {
-                const gift = dakshinaRequestModal.gift;
-                setDakshinaRequestModal({ visible: false });
-                if (gift) handleSendGift(gift);
-              }} className="flex-1 py-3.5 rounded-2xl bg-gradient-to-r from-amber-500 to-orange-500 text-white text-sm font-bold shadow-lg shadow-amber-500/20 hover:shadow-amber-500/30 transition-all active:scale-[0.97] flex items-center justify-center gap-2">
-                <Send className="w-4 h-4" />
-                Send{dakshinaRequestModal.gift?.price ? ` ₹${dakshinaRequestModal.gift.price}` : ''}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* ═══════ DAKSHINA MODAL ═══════ */}
       <DakshinaModal
         isOpen={showGiftModal}
@@ -1773,6 +2281,86 @@ export default function LiveSessionViewPage() {
       />
 
       </div>
+      {/* ═══════ BROADCASTER QUEUE PANEL ═══════ */}
+      <AnimatePresence>
+        {isBroadcaster && showQueuePanel && (
+          <motion.div
+            initial={{ x: '100%' }}
+            animate={{ x: 0 }}
+            exit={{ x: '100%' }}
+            transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+            className="absolute top-0 right-0 h-full w-72 max-w-[80vw] z-40 bg-black/80 backdrop-blur-xl border-l border-white/10 flex flex-col"
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b border-white/10">
+              <h3 className="text-white text-sm font-bold flex items-center gap-2">
+                <Users className="w-4 h-4 text-orange-400" />
+                Queue ({queue.length})
+              </h3>
+              <button onClick={() => setShowQueuePanel(false)} className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center text-white/60 hover:text-white hover:bg-white/20 transition-all">
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-3 space-y-2">
+              {queue.length === 0 && (
+                <div className="text-white/40 text-xs text-center py-8 italic">No users in queue</div>
+              )}
+              {queue.map((q) => (
+                <div key={q._id} className="bg-white/5 border border-white/10 rounded-xl p-3 flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-full bg-gradient-to-br from-orange-400 to-amber-500 flex items-center justify-center flex-shrink-0">
+                    <span className="text-white text-xs font-bold">{q.userName?.charAt(0)?.toUpperCase()}</span>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-white text-xs font-bold truncate">{q.userName}</p>
+                    <p className="text-white/40 text-[10px] font-medium">
+                      {q.isPrivate ? 'Private' : 'Public'}
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => handleInviteUser(q)}
+                    disabled={invitingUserIds.has(q.userId)}
+                    className="px-3 py-1.5 rounded-full bg-orange-500 text-white text-[10px] font-bold active:scale-95 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1 flex-shrink-0"
+                  >
+                    {invitingUserIds.has(q.userId) ? <Loader2 className="w-3 h-3 animate-spin" /> : <UserPlus className="w-3 h-3" />}
+                    {invitingUserIds.has(q.userId) ? 'Inviting...' : 'Invite'}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ═══════ END SESSION CONFIRMATION ═══════ */}
+      {showEndConfirm && (
+        <div className="fixed inset-0 z-[250] flex items-center justify-center p-6">
+          <div className="absolute inset-0 bg-black/70 backdrop-blur-md" onClick={() => setShowEndConfirm(false)} />
+          <div className="relative bg-white rounded-[28px] p-6 max-w-sm w-full shadow-2xl border border-orange-100 animate-scale-in">
+            <div className="w-14 h-14 rounded-full bg-red-50 flex items-center justify-center mx-auto mb-4">
+              <StopCircle className="w-7 h-7 text-red-500" />
+            </div>
+            <h3 className="text-lg font-black text-gray-900 text-center mb-1">End Live Session?</h3>
+            <p className="text-gray-500 text-xs text-center mb-6 leading-relaxed">
+              This will stop the live stream, remove all viewers from the queue, and end any active call.
+            </p>
+            <div className="flex gap-3">
+              <button
+                onClick={() => setShowEndConfirm(false)}
+                className="flex-1 py-3 rounded-xl bg-gray-100 text-gray-700 text-sm font-bold active:scale-95 transition-all hover:bg-gray-200"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => { setShowEndConfirm(false); handleEndBroadcasterSession(); }}
+                disabled={endingSession}
+                className="flex-1 py-3 rounded-xl bg-gradient-to-r from-red-500 to-rose-500 text-white text-sm font-bold active:scale-95 transition-all disabled:opacity-60 shadow-lg shadow-red-500/20"
+              >
+                {endingSession ? 'Ending...' : 'End Session'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ═══════ END CENTERED STAGE ═══════ */}
 
       {/* ═══════ CSS ═══════ */}

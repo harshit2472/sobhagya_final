@@ -25,7 +25,7 @@ export default function PrivacyPolicy() {
       <div className="section-container pb-20">
         <div className="max-w-4xl mx-auto">
           {/* Privacy Policy Content */}
-          <div className="prose prose-orange max-w-none font-poppins text-gray-700 leading-relaxed space-y-10">
+          <div lang="en" className="prose prose-orange max-w-none font-poppins text-gray-700 leading-8 tracking-[0.01em] space-y-10 text-left md:text-justify hyphens-auto break-words [text-align-last:left]">
             
             {/* Introduction */}
             <section>

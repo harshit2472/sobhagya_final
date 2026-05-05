@@ -16,6 +16,11 @@ interface OfflineAstrologerModalProps {
   isOpen: boolean;
   onClose: () => void;
   offlineAstrologerName: string;
+  /**
+   * `offline` — astrologer was not online (default).
+   * `busy`    — astrologer was online but declined / is on another session.
+   */
+  reason?: "offline" | "busy";
 }
 
 interface OnlineAstrologer {
@@ -60,7 +65,18 @@ export default function OfflineAstrologerModal({
   isOpen,
   onClose,
   offlineAstrologerName,
+  reason = "offline",
 }: OfflineAstrologerModalProps) {
+  const isBusy = reason === "busy";
+  const heading = isBusy
+    ? "Astrologer is busy right now"
+    : "Astrologer is not available online";
+  const subheading = isBusy
+    ? " is currently busy with another session. Try one of these online astrologers instead:"
+    : " was not available online. Try one of these online astrologers instead:";
+  const emptyMessage = isBusy
+    ? "All other astrologers are busy too. Please try again shortly."
+    : "No astrologers are online right now. Please try again shortly.";
   const router = useRouter();
   const [mounted, setMounted] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -129,7 +145,7 @@ export default function OfflineAstrologerModal({
         );
         if (!cancelled) {
           if (onlineList.length === 0 && onlineFromCache.length === 0) {
-            setError("No astrologers are online right now. Please try again shortly.");
+            setError(emptyMessage);
           }
           setOnline(onlineList.slice(0, ONLINE_LIMIT));
         }
@@ -148,7 +164,7 @@ export default function OfflineAstrologerModal({
     return () => {
       cancelled = true;
     };
-  }, [isOpen]);
+  }, [isOpen, emptyMessage]);
 
   const handleChat = (a: OnlineAstrologer) => {
     onClose();
@@ -205,12 +221,11 @@ export default function OfflineAstrologerModal({
               id="offline-astro-title"
               className="text-base sm:text-lg font-bold text-gray-900 leading-snug no-justify"
             >
-              Astrologer is not available online
+              {heading}
             </h2>
             <p className="mt-1 text-xs text-gray-600 no-justify">
-              <span className="font-semibold text-gray-800">{offlineAstrologerName}</span>{" "}
-              was not available online. Try one of these online astrologers
-              instead:
+              <span className="font-semibold text-gray-800">{offlineAstrologerName}</span>
+              {subheading}
             </p>
           </div>
           <button

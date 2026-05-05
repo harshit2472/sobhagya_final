@@ -9,22 +9,6 @@ export const metadata = {
 export default function PricingPolicy() {
   return (
     <div className="min-h-screen bg-white">
-      {/* Header */}
-      <div className="bg-white border-b border-gray-200">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex justify-between items-center py-4">
-            <Link href="/" className="flex items-center space-x-2">
-              <span className="text-2xl font-bold text-[#556B2F]"></span>
-            </Link>
-            <Link 
-              href="/"
-              className="text-[#F7971E] hover:text-[#E68A19] transition-colors duration-200"
-            >
-              ← Back to Home
-            </Link>
-          </div>
-        </div>
-      </div>
 
       {/* Main Content */}
       <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
@@ -41,7 +25,7 @@ export default function PricingPolicy() {
 
           {/* Pricing Policy Content - Formatted Content */}
           <div className="prose prose-lg max-w-none">
-            <div className="space-y-8 text-gray-700 leading-relaxed">
+            <div lang="en" className="space-y-8 text-gray-700 leading-8 tracking-[0.01em] text-left md:text-justify hyphens-auto break-words [text-align-last:left]">
               
               {/* Introduction */}
               <section>

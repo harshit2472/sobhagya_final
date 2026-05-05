@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
-import { Star, ArrowLeft, RefreshCw, Heart, Users, TrendingUp } from 'lucide-react';
+import { Star, RefreshCw, Heart, Users, TrendingUp } from 'lucide-react';
 import Lottie from 'lottie-react';
 import Link from 'next/link';
 
@@ -247,25 +247,6 @@ export default function HoroscopeService() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-orange-50 via-white to-yellow-50">
-      {/* Header */}
-      <div className="bg-white shadow-sm border-b border-orange-100">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-16">
-            <Link 
-              href="/services"
-              className="flex items-center gap-2 text-gray-600 hover:text-orange-600 transition-colors duration-200"
-            >
-              <ArrowLeft className="w-5 h-5" />
-              <span className="font-medium">Back to Services</span>
-            </Link>
-            <div className="flex items-center gap-2">
-              <Star className="w-5 h-5 text-orange-500" />
-              <span className="text-sm text-gray-500">Daily Horoscope</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
       {/* Main Content */}
       <div className="py-16 lg:py-24">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
