@@ -50,6 +50,11 @@ import SessionEndedCard from '../components/chat/SessionEndedCard';
 import AwayCountdownOverlay from '../components/chat/AwayCountdownOverlay';
 import RatingModal from '../components/ui/RatingModal';
 import DakshinaModal from '../components/calling/ui/DakshinaModal';
+import OfflineAstrologerModal from '../components/astrologers/OfflineAstrologerModal';
+import {
+  findOrFetchAstrologer,
+  getCachedAstrologer,
+} from '../utils/astrologer-cache';
 
 const AWAY_GRACE_MS = 10_000;
 
@@ -185,6 +190,12 @@ export default function ChatPage() {
   const [showDakshina, setShowDakshina] = useState(false);
   const [gifts, setGifts] = useState<any[]>([]);
   const [chatAgainPending, setChatAgainPending] = useState(false);
+
+  // Suggestion modal shown when "Chat again" can't be honoured because the
+  // astrologer is offline ('offline') or rejected/is on another session ('busy').
+  const [suggestionModal, setSuggestionModal] = useState<
+    { reason: 'offline' | 'busy'; name: string } | null
+  >(null);
 
   // Live billing/timer state.
   const [walletBalance, setWalletBalance] = useState<number | null>(null);
@@ -929,8 +940,27 @@ export default function ChatPage() {
     if (!userId || !activeThread) return;
     if (chatAgainPending) return;
     setChatAgainPending(true);
+    const providerId = activeThread.providerId._id;
+    const providerName = activeThread.providerId.name || 'Astrologer';
     try {
-      const result = await createChatSession(userId, activeThread.providerId._id);
+      // 1. Check the astrologer's current status before opening a session so we
+      //    can surface "offline" suggestions without burning a backend call.
+      const cached =
+        getCachedAstrologer(providerId) ||
+        (await findOrFetchAstrologer(providerId).catch(() => null));
+      const status = String(
+        (cached as { status?: string } | null)?.status || ''
+      ).toLowerCase();
+      if (cached && status && status !== 'online') {
+        setSuggestionModal({
+          reason: status === 'busy' ? 'busy' : 'offline',
+          name: providerName,
+        });
+        return;
+      }
+
+      // 2. Astrologer looks online (or status unknown) — try to create a session.
+      const result = await createChatSession(userId, providerId);
       if (result.ok) {
         const qs = new URLSearchParams({
           threadId: result.data.threadId,
@@ -938,7 +968,25 @@ export default function ChatPage() {
         });
         router.push(`/chat?${qs.toString()}`);
       } else {
-        console.warn('[chat] chat again failed:', result.error.message);
+        const msg = (result.error.message || '').toLowerCase();
+        const isBusy =
+          msg.includes('busy') ||
+          msg.includes('decline') ||
+          msg.includes('another session') ||
+          msg.includes('in a session');
+        const isOffline =
+          msg.includes('offline') ||
+          msg.includes('not online') ||
+          msg.includes('not available') ||
+          msg.includes('unavailable');
+        if (isBusy || isOffline) {
+          setSuggestionModal({
+            reason: isBusy ? 'busy' : 'offline',
+            name: providerName,
+          });
+        } else {
+          console.warn('[chat] chat again failed:', result.error.message);
+        }
       }
     } finally {
       setChatAgainPending(false);
@@ -1440,6 +1488,15 @@ export default function ChatPage() {
             window.location.href = '/chat';
           }
         }}
+      />
+
+      {/* Offline / busy suggestion modal — shown when "Chat again" can't open
+          a session because the astrologer is offline or busy. */}
+      <OfflineAstrologerModal
+        isOpen={suggestionModal !== null}
+        onClose={() => setSuggestionModal(null)}
+        offlineAstrologerName={suggestionModal?.name || 'Astrologer'}
+        reason={suggestionModal?.reason || 'offline'}
       />
 
       {/* Dakshina modal */}

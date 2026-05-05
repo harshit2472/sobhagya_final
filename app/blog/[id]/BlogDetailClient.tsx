@@ -131,14 +131,6 @@ export default function BlogDetailClient({ slug }: { slug: string }) {
   return (
     <div className="min-h-screen bg-gray-50/30 pb-20 pt-6 sm:pt-8">
       <div className="max-w-4xl mx-auto px-4 sm:px-6">
-        {/* Breadcrumb / Back Button */}
-        <Link 
-          href="/blog" 
-          className="inline-flex items-center gap-2 text-orange-600 hover:text-orange-700 font-medium mb-8 transition-colors"
-        >
-          <ArrowLeft className="w-4 h-4" />
-          Back to all articles
-        </Link>
         
         {/* Article Header */}
         <header className="mb-10 text-center sm:text-left">

@@ -5,7 +5,7 @@ import { motion } from 'framer-motion';
 import Link from 'next/link';
 import { Star } from 'lucide-react';
 import Head from 'next/head';
-import { ArrowLeft, Calendar, Clock, MapPin, User, Download, Share2, ChevronDown, AlertTriangle, CheckCircle, Zap, Shield, Globe } from 'lucide-react';
+import { Calendar, Clock, MapPin, User, Download, Share2, ChevronDown, AlertTriangle, CheckCircle, Zap, Shield, Globe } from 'lucide-react';
 import KundliChart from '../components/KundliChart';
 
 export default function FreeKundliPage() {
@@ -740,25 +740,6 @@ export default function FreeKundliPage() {
           </div>
         </motion.div>
       )}
-
-      {/* Header */}
-      <div className="bg-white shadow-sm border-b border-orange-100">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between min-h-16 py-3 gap-3">
-            <Link 
-              href="/" 
-              className="flex items-center gap-2 text-gray-600 hover:text-orange-600 transition-colors duration-200"
-            >
-              <ArrowLeft className="w-5 h-5" />
-              <span className="font-medium text-sm sm:text-base">Back to Home</span>
-            </Link>
-            <div className="flex items-center gap-2 shrink-0">
-              <div className="w-2 h-2 bg-orange-500 rounded-full animate-pulse"></div>
-              <span className="text-xs sm:text-sm text-gray-500">Free Kundli Generator</span>
-            </div>
-          </div>
-        </div>
-      </div>
 
       {/* Hero Section */}
       <div className="py-10 sm:py-14 lg:py-20">

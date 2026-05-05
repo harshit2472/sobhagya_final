@@ -39,18 +39,43 @@ export interface QueueItem {
   sessionId: string;
 }
 
-export function useLiveSocket() {
+/**
+ * Hook options.
+ * Pass `sessionId` for the broadcaster's hook so that:
+ *   1. The handshake.query carries `sessionId` (the backend's `disconnect`
+ *      handler keys the 30s session-end timer off this field).
+ *   2. Every *reconnect* (i.e. every `connect` after the first) auto-emits
+ *      `partner-reconnect` to cancel that timer immediately. Without this,
+ *      a refresh or brief network blip during a live session causes the
+ *      backend to end the session 30s later.
+ */
+export interface UseLiveSocketOptions {
+  /** Pass the live-session id when the current user is the broadcaster. */
+  sessionId?: string;
+}
+
+export function useLiveSocket(options: UseLiveSocketOptions = {}) {
+  const { sessionId: connectSessionId } = options;
   const socketRef = useRef<Socket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  // Tracks whether we've completed at least one `connect` — used to detect
+  // *reconnect* events so we can re-emit `partner-reconnect` for broadcasters.
+  const hasConnectedOnceRef = useRef(false);
 
   useEffect(() => {
     const userDetails = getUserDetails();
     const userId = userDetails?.id || userDetails?._id || 'anonymous';
     const token = getAuthToken() || '';
+    const role = userDetails?.role || 'user';
+
+    const query: Record<string, string> = { userId: String(userId), role: String(role), token };
+    // Broadcaster: include sessionId so the backend's disconnect handler can
+    // pair us with the live session and schedule its end if we go offline.
+    if (connectSessionId) query.sessionId = connectSessionId;
 
     const socket = io(LIVE_SOCKET_URL, {
       path: LIVE_SOCKET_PATH,
-      query: { userId, token },
+      query,
       transports: ['websocket', 'polling'],
       reconnection: true,
       reconnectionDelay: 2000,
@@ -59,6 +84,15 @@ export function useLiveSocket() {
 
     socket.on('connect', () => {
       console.log('[LiveSocket] Connected:', socket.id);
+      // Reconnect path (broadcaster only): cancel the 30s session-end timer
+      // that the backend scheduled when this socket disconnected.
+      if (hasConnectedOnceRef.current && connectSessionId) {
+        console.log('[LiveSocket] Auto-emitting partner-reconnect for', connectSessionId);
+        socket.emit('partner-reconnect', connectSessionId, (resp: any) => {
+          console.log('[LiveSocket] partner-reconnect ack:', resp);
+        });
+      }
+      hasConnectedOnceRef.current = true;
       setIsConnected(true);
     });
 
@@ -85,18 +119,24 @@ export function useLiveSocket() {
       socket.disconnect();
       socketRef.current = null;
       setIsConnected(false);
+      hasConnectedOnceRef.current = false;
     };
-  }, []);
+  }, [connectSessionId]);
 
   const getSessions = useCallback((lastSessionId?: string, limit: number = 20): Promise<LiveSession[]> => {
     return new Promise((resolve) => {
       if (!socketRef.current) { resolve([]); return; }
       socketRef.current.emit('getSessions', { lastSessionId, limit }, (resp: any) => {
-        if (!resp.error && resp.sessions) {
+        // Match Swift: success when `error == 0/false` OR `sessions` array is present.
+        if (resp && Array.isArray(resp.sessions)) {
           resolve(resp.sessions);
-        } else {
-          resolve([]);
+          return;
         }
+        if (resp && (resp.error === 0 || resp.error === false)) {
+          resolve(Array.isArray(resp.sessions) ? resp.sessions : []);
+          return;
+        }
+        resolve([]);
       });
     });
   }, []);
@@ -104,8 +144,14 @@ export function useLiveSocket() {
   const startSession = useCallback((sessionId: string, broadcasterId: string, broadcasterName: string, broadcasterProfilePicture: string): Promise<any> => {
     return new Promise((resolve) => {
       if (!socketRef.current) { resolve({ error: true, message: "Socket not connected" }); return; }
+      let settled = false;
+      const finish = (r: any) => { if (settled) return; settled = true; resolve(r); };
+      // Match Swift: timingOut(after: 15). Without this the broadcaster UI hangs
+      // forever if the backend silently drops the ack.
+      const timer = setTimeout(() => finish({ error: true, message: 'START_SESSION_TIMEOUT' }), 15000);
       socketRef.current.emit('startSession', { sessionId, broadcasterId, broadcasterName, broadcasterProfilePicture }, (resp: any) => {
-        resolve(resp);
+        clearTimeout(timer);
+        finish(resp);
       });
     });
   }, []);
@@ -128,6 +174,17 @@ export function useLiveSocket() {
       const userProfilePicture = userDetails?.avatar || '';
 
       socketRef.current.emit('joinSession', { sessionId, userName, userId, userProfilePicture }, (resp: any) => {
+        // Match Swift: a session that has already ended comes back as
+        // `{ error: 1, status: 'ended' }`. Surface a clean code so the page can
+        // route to "session ended" UI without ambiguity.
+        if (resp && (resp.error === 1 || resp.error === true) && resp.status === 'ended') {
+          resolve({ error: true, code: 'SESSION_ENDED', raw: resp });
+          return;
+        }
+        if (resp && resp.status === 'error') {
+          resolve({ error: true, code: 'JOIN_FAILED', raw: resp });
+          return;
+        }
         resolve(resp);
       });
     });
@@ -177,11 +234,20 @@ export function useLiveSocket() {
       const name = userDetails?.name || userDetails?.displayName || 'User';
       const profilePicture = userDetails?.avatar || '';
 
+      let settled = false;
+      const finish = (r: ChatMessage | null) => { if (settled) return; settled = true; resolve(r); };
+      // Swift fires-and-forgets `add_chat`. The web previously awaited the ack
+      // and dropped the message when the backend skipped it. Local-echo after
+      // 1 s so the sender always sees their own message — the broadcasted
+      // `chat_update` will dedupe via list semantics on other clients.
+      const localEcho: ChatMessage = { userId, name, message, profilePicture, timestamp: new Date().toISOString() };
+      const timer = setTimeout(() => finish(localEcho), 1000);
       socketRef.current.emit('add_chat', { sessionId, userId, name, message, profilePicture }, (resp: any) => {
-        if (!resp.error && resp.data) {
-          resolve(resp.data);
+        clearTimeout(timer);
+        if (resp && !resp.error && resp.data) {
+          finish(resp.data);
         } else {
-          resolve(null);
+          finish(localEcho);
         }
       });
     });
@@ -236,10 +302,29 @@ export function useLiveSocket() {
           try { ac = JSON.parse(ac); } catch { ac = null; }
         }
         if (!ac || typeof ac !== 'object') { resolve(null); return; }
-        if (!ac.channelId && !ac.userId && !ac.user) { resolve(null); return; }
-        if (typeof ac.isPrivate === 'string') {
+        
+        // If the backend returned a map of calls (e.g., {"user123": { channelId: ... }}),
+        // extract the first actual call object from it.
+        if (!Array.isArray(ac) && !ac.channelId && !ac.userId && !ac.user) {
+          const values = Object.values(ac);
+          if (values.length > 0 && typeof values[0] === 'object' && values[0] !== null) {
+            ac = values[0];
+          } else {
+            resolve(null); return;
+          }
+        } else if (!Array.isArray(ac) && !ac.channelId && !ac.userId && !ac.user) {
+          resolve(null); return;
+        }
+
+        if (Array.isArray(ac)) {
+          ac = ac.map(call => {
+            if (typeof call.isPrivate === 'string') call.isPrivate = call.isPrivate === 'true';
+            return call;
+          });
+        } else if (typeof ac.isPrivate === 'string') {
           ac.isPrivate = ac.isPrivate === 'true';
         }
+        
         console.log('[LiveSocket] get_active_call PARSED:', ac);
         resolve(ac);
       });
@@ -325,8 +410,22 @@ export function useLiveSocket() {
       if (!socketRef.current) { resolve(null); return; }
       const userDetails = getUserDetails();
       const userId = userDetails?.id || userDetails?._id || '';
-      socketRef.current.emit('end_call', { sessionId, channelId, userId, reason: 'user_ended' }, (resp: any) => {
+      let settled = false;
+      const finish = (resp: any) => {
+        if (settled) return;
+        settled = true;
         resolve(resp);
+      };
+      // Backend's end_call handler does not ack on the success path — it only
+      // broadcasts `call_end`. Without a timeout the await sits forever and
+      // blocks downstream cleanup (e.g. handleEndBroadcasterSession awaits
+      // endCall before tearing the session down).
+      const timer = setTimeout(() => {
+        finish({ error: false, viaTimeout: true });
+      }, 3000);
+      socketRef.current.emit('end_call', { sessionId, channelId, userId, reason: 'user_ended' }, (resp: any) => {
+        clearTimeout(timer);
+        finish(resp);
       });
     });
   }, []);
@@ -336,6 +435,53 @@ export function useLiveSocket() {
       if (!socketRef.current) { resolve(null); return; }
       socketRef.current.emit('connectedWithLivekit', { sessionId, isHlsStream }, (resp: any) => {
         resolve(resp);
+      });
+    });
+  }, []);
+
+  /**
+   * Manually emit `partner-reconnect` (the broadcaster's hook auto-emits this
+   * on reconnect — exposed for explicit calls e.g. when a broadcaster regains
+   * focus on a tab).
+   */
+  const emitPartnerReconnect = useCallback((sessionId: string): Promise<any> => {
+    return new Promise((resolve) => {
+      if (!socketRef.current) { resolve({ success: false, error: true }); return; }
+      socketRef.current.emit('partner-reconnect', sessionId, (resp: any) => resolve(resp));
+    });
+  }, []);
+
+  /**
+   * Broadcaster invites a queued user to a call. Backend persists the call
+   * with `channelId` (frontend-generated) and broadcasts `call_started` to
+   * the session room when the user accepts via `accept_invite`.
+   */
+  const emitSendInvite = useCallback((params: {
+    sessionId: string;
+    channelId: string;
+    queueId: string;
+    userId: string;
+    isPrivate: boolean;
+  }): Promise<any> => {
+    return new Promise((resolve) => {
+      if (!socketRef.current) { resolve({ error: true, message: 'Socket not connected' }); return; }
+      socketRef.current.emit('send_invite', params, (resp: any) => resolve(resp));
+    });
+  }, []);
+
+  /**
+   * Wallet balance via the live socket. Mirrors the REST `/wallet/balance`
+   * endpoint and is preferred when the live socket is already connected
+   * because it avoids an extra round-trip.
+   */
+  const getBalanceViaSocket = useCallback((userId: string): Promise<{ error: boolean; balance: number }> => {
+    return new Promise((resolve) => {
+      if (!socketRef.current) { resolve({ error: true, balance: 0 }); return; }
+      socketRef.current.emit('getBalance', { userId }, (resp: any) => {
+        resolve({
+          error: !!resp?.error,
+          balance: Number(resp?.data?.balance || 0),
+        });
       });
     });
   }, []);
@@ -360,25 +506,26 @@ export function useLiveSocket() {
     });
   }, []);
 
-  const emitSendGift = useCallback((sessionId: string, gift: any, receiverName: string, receiverId?: string): Promise<any> => {
+  const emitSendGift = useCallback((sessionId: string, gift: any, receiverId: string): Promise<any> => {
     return new Promise((resolve, reject) => {
       if (!socketRef.current) { reject(new Error('Socket not connected')); return; }
+      if (!receiverId) { reject(new Error('Missing receiver id for gift')); return; }
       const userDetails = getUserDetails();
       const userId = userDetails?.id || userDetails?._id || '';
       const userName = userDetails?.name || userDetails?.displayName || 'User';
       const itemSendId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
+      // Field set matches Swift's emitSendGift exactly: no `toName` extra.
       const payload = {
-        sessionId,
-        channelId: sessionId,
         giftId: gift._id,
+        giftIcon: gift.icon,
+        channelId: sessionId,
         from: userId,
         fromName: userName,
-        to: receiverId || receiverName,
-        giftName: gift.name,
-        giftIcon: gift.icon,
-        toName: receiverName,
         itemSendId,
+        to: receiverId,
+        giftName: gift.name,
+        sessionId,
       };
 
       socketRef.current.emit('send_gift', payload, (resp: any) => {
@@ -417,17 +564,6 @@ export function useLiveSocket() {
     return () => { socketRef.current?.off('call_started'); };
   }, []);
 
-  const onInviteReceived = useCallback((callback: (data: any) => void) => {
-    // Different backends broadcast the "astrologer invited you" notification
-    // under different event names. Subscribe to all known variants.
-    const events = ['send_invite', 'invite_received', 'inviteReceived', 'invite_sent', 'inviteSent', 'invitationReceived'];
-    const handler = (resp: any) => {
-      callback(resp?.data ?? resp);
-    };
-    events.forEach(e => socketRef.current?.on(e, handler));
-    return () => { events.forEach(e => socketRef.current?.off(e, handler)); };
-  }, []);
-
   const onCallEnd = useCallback((callback: (data: any) => void) => {
     socketRef.current?.on('call_end', callback);
     return () => { socketRef.current?.off('call_end'); };
@@ -448,9 +584,28 @@ export function useLiveSocket() {
     return () => { socketRef.current?.off('receive_gift'); };
   }, []);
 
+  // Mirrors Swift `onGiftRequest`. Backend broadcasts `gift_request` ahead of
+  // `receive_gift` for host-side confirmation flows; expose so the page can
+  // subscribe alongside `onGiftReceived`.
   const onGiftRequest = useCallback((callback: (data: any) => void) => {
     socketRef.current?.on('gift_request', callback);
     return () => { socketRef.current?.off('gift_request'); };
+  }, []);
+
+  const onSendInvite = useCallback((callback: (data: any) => void) => {
+    socketRef.current?.on('send_invite', callback);
+    return () => { socketRef.current?.off('send_invite', callback); };
+  }, []);
+
+  /**
+   * Backend emits `sessionStarted` to the room when a broadcaster's
+   * `startSession` succeeds. Useful as a confirmation/UI hook on the
+   * broadcaster side and for any viewer that reaches the room before the
+   * session is fully provisioned.
+   */
+  const onSessionStarted = useCallback((callback: (data: any) => void) => {
+    socketRef.current?.on('sessionStarted', callback);
+    return () => { socketRef.current?.off('sessionStarted', callback); };
   }, []);
 
   return {
@@ -474,17 +629,21 @@ export function useLiveSocket() {
     acceptInvite,
     endCall,
     emitConnectedWithLivekit,
+    emitPartnerReconnect,
+    emitSendInvite,
+    getBalanceViaSocket,
     onChatUpdate,
     onViewerUpdate,
     onViewerLeft,
     onSessionEnded,
+    onSessionStarted,
     onCallStarted,
-    onInviteReceived,
     onCallEnd,
     onQueueJoined,
     onLikeUpdate,
     onGiftReceived,
     onGiftRequest,
+    onSendInvite,
     emitSendGift,
     fetchGifts,
   };

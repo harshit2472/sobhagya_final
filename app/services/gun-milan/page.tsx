@@ -1011,25 +1011,6 @@ export default function MatchmakingPage() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-pink-50 via-white to-orange-50">
-      {/* Header */}
-      <div className="bg-white shadow-sm border-b border-pink-100">
-        <div className="w-full px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center justify-between h-16">
-            <Link 
-              href="/services" 
-              className="flex items-center gap-2 text-gray-600 hover:text-pink-600 transition-colors duration-200"
-            >
-              <ArrowLeft className="w-5 h-5" />
-              <span className="font-medium">Back to Services</span>
-            </Link>
-            <div className="flex items-center gap-2">
-              <div className="w-2 h-2 bg-pink-500 rounded-full animate-pulse"></div>
-              <span className="text-sm text-gray-500">Gun Milan Calculator</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
       {/* Beautiful Error Notification */}
       {errorMessage && (
         <motion.div
