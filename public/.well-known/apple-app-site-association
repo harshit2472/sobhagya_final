@@ -1,0 +1,13 @@
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": ["TAF7Z34MZM.com.sobhagya.elysion"],
+        "components": [
+          { "/": "/app/*" },
+          { "/": "/user/*" }
+        ]
+      }
+    ]
+  }
+}

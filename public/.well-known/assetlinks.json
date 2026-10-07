@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.sobhagya.sobhagya",
+      "sha256_cert_fingerprints": [
+        "16:B0:5F:E8:0D:13:FD:A1:F0:54:3E:37:42:DB:32:05:1F:F2:6C:77:89:E6:17:8D:B6:65:A3:14:10:84:A4:48"
+      ]
+    }
+  }
+]

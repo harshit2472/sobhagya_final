@@ -61,6 +61,16 @@ const nextConfig = {
         ],
       },
       {
+        // iOS Universal Links: file has no extension, so force the JSON content type
+        source: '/.well-known/apple-app-site-association',
+        headers: [{ key: 'Content-Type', value: 'application/json' }],
+      },
+      {
+        // Android App Links
+        source: '/.well-known/assetlinks.json',
+        headers: [{ key: 'Content-Type', value: 'application/json' }],
+      },
+      {
         // Cache static assets aggressively
         source: '/(.*)\\.(svg|png|jpg|jpeg|gif|webp|ico)',
         headers: [
